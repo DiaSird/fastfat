@@ -5,8 +5,8 @@ use eframe::egui;
 
 use super::RowKind;
 
-/// Height kept free below the panes for the progress and status lines.
-pub(super) const RESERVED_HEIGHT: f32 = 90.0;
+/// Height kept free below a list for the hint line under it.
+pub(super) const RESERVED_HEIGHT: f32 = 28.0;
 
 /// Focus value of the `..` row.
 pub(super) const PARENT_ROW: isize = -1;
@@ -22,7 +22,7 @@ pub(super) const fn icon(kind: RowKind) -> &'static str {
 
 /// Returns the height available to a pane's list.
 pub(super) fn list_height(ui: &egui::Ui) -> f32 {
-    (ui.available_height() - RESERVED_HEIGHT).max(160.0)
+    (ui.available_height() - RESERVED_HEIGHT).max(80.0)
 }
 
 /// The selected row of a pane, kept in egui memory and forgotten when the

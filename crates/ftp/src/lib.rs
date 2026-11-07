@@ -9,8 +9,9 @@
 //!    and returns a [`DownloadPlan`] that tells which files already exist on
 //!    the PC.
 //! 3. [`DownloadPlan::download`] (`download.rs`) receives the files over one
-//!    or more connections and reports [`TransferEvent`]s for progress
-//!    displays.
+//!    or more connections (`workers.rs`), checks the size of every file,
+//!    downloads failed files again and reports [`TransferEvent`]s for
+//!    progress displays.
 //!
 //! Safety: only commands that cannot change the server are ever sent (see
 //! [`ALLOWED_COMMANDS`]).
@@ -21,12 +22,13 @@ mod error;
 mod listing;
 mod paths;
 mod plan;
+mod workers;
 
 #[cfg(test)]
 mod tests;
 
 pub use client::FtpClient;
-pub use download::{CopyStats, MAX_WORKERS, TransferEvent};
+pub use download::{CopyStats, MAX_RETRIES, MAX_WORKERS, TransferEvent};
 pub use error::FtpError;
 pub use listing::{FtpEntry, FtpEntryKind, parse_list_line, parse_mlsd_line};
 pub use paths::{join, parent, sanitize_name};

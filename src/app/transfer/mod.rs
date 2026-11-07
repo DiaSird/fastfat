@@ -4,8 +4,7 @@
 //! window stays usable: browsing goes on and further downloads are queued.
 //!
 //! * this file: the queue ([`Transfers`]): start, poll, cancel.
-//! * `worker.rs`: what the transfer thread does, including asking the user
-//!   about files that already exist on the PC.
+//! * `worker.rs`: what the transfer thread does.
 //! * `progress.rs`: the progress the thread publishes ([`progress::TransferView`]).
 //! * `speed.rs`: transfer speed and remaining time.
 //! * `panel.rs`: the progress panel drawn above the progress bar.
@@ -18,7 +17,6 @@ mod worker;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -44,6 +42,8 @@ pub(super) struct TransferRequest {
     pub(super) destination: PathBuf,
     /// Connections to use.
     pub(super) workers: usize,
+    /// What to do with files already on the PC.
+    pub(super) existing: ExistingFiles,
 }
 
 /// A transfer running on its thread.
@@ -52,8 +52,6 @@ struct Running {
     view: Arc<Mutex<TransferView>>,
     /// Set to cancel.
     cancel: Arc<AtomicBool>,
-    /// Answer to the question about existing files (`None` cancels).
-    answer: Sender<Option<ExistingFiles>>,
     /// The thread; its value is the result.
     handle: JoinHandle<Result<CopyStats, FtpError>>,
 }
@@ -88,18 +86,16 @@ impl Transfers {
         };
         let view = Arc::new(Mutex::new(TransferView::default()));
         let cancel = Arc::new(AtomicBool::new(false));
-        let (answer, answers) = mpsc::channel();
         let (thread_view, thread_cancel) = (Arc::clone(&view), Arc::clone(&cancel));
         let spawned = thread::Builder::new()
             .name("ftp-transfer".to_owned())
-            .spawn(move || run(&request, &thread_view, &thread_cancel, &answers));
+            .spawn(move || run(&request, &thread_view, &thread_cancel));
         // Without a thread the request cannot run; report the error as the
         // result of the next poll.
         let handle = spawned.unwrap_or_else(|err| thread::spawn(move || Err(FtpError::Io(err))));
         self.running = Some(Running {
             view,
             cancel,
-            answer,
             handle,
         });
     }

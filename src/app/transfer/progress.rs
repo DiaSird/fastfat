@@ -41,8 +41,12 @@ pub(super) struct TransferView {
     pub(super) folders: HashMap<String, FolderProgress>,
     /// File of each connection.
     pub(super) active: Vec<Option<ActiveFile>>,
-    /// Files already on the PC (all, same size) while waiting for the user.
-    pub(super) question: Option<(u64, u64)>,
+    /// Files skipped because the PC already had them.
+    pub(super) skipped: u64,
+    /// Retry round in progress and its file count.
+    pub(super) retry: Option<(u32, usize)>,
+    /// Files that failed so far (retried later).
+    pub(super) failures: u64,
     /// Transfer speed.
     pub(super) speed: SpeedMeter,
 }
@@ -92,6 +96,25 @@ impl TransferView {
                 }
                 if let Some(slot) = self.active.get_mut(worker) {
                     *slot = None;
+                }
+            }
+            TransferEvent::Failed { worker, .. } => {
+                // Not counted as done: the retry reports it again.
+                self.failures += 1;
+                if let Some(slot) = self.active.get_mut(worker) {
+                    *slot = None;
+                }
+            }
+            TransferEvent::Retrying { round, files } => self.retry = Some((round, files)),
+            TransferEvent::Skipped { file } => {
+                // Done without a transfer: count the file, not its bytes.
+                self.skipped += 1;
+                for progress in [
+                    &mut self.total,
+                    self.folders.entry(ftp::parent(&file.remote)).or_default(),
+                ] {
+                    progress.files_done += 1;
+                    progress.bytes = progress.bytes.saturating_sub(file.size);
                 }
             }
         }

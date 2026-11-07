@@ -1,29 +1,31 @@
 //! Step 2 of a download: receiving the planned files.
 //!
-//! [`DownloadPlan::download`] puts the files in a queue, largest first, and
-//! starts `workers` connections that each take the next file until the
-//! queue is empty. The caller follows the transfer through
-//! [`TransferEvent`]s and can cancel from them. When one connection fails,
-//! all stop and the partly written file is removed.
+//! [`DownloadPlan::download`] receives the files in rounds:
+//!
+//! 1. Every file is downloaded once (see `workers.rs` for one round). When
+//!    its turn comes, a file already on the PC is skipped or replaced as the
+//!    [`ExistingFiles`] choice says. Each file is checked right after it
+//!    arrives: the bytes received and the
+//!    size of the file on the PC must equal the size on the server. A file
+//!    that fails (network error or wrong size) does not stop the others.
+//! 2. The files that failed are downloaded again, overwriting the bad copy,
+//!    up to [`MAX_RETRIES`] times.
+//! 3. Files that still fail are reported in [`FtpError::Incomplete`].
+//!
+//! The caller follows the transfer through [`TransferEvent`]s and can cancel
+//! from them.
 
-use std::collections::VecDeque;
-use std::fs::{self, File};
-use std::io::BufWriter;
 use std::ops::ControlFlow;
-use std::path::PathBuf;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 
-use crate::paths::with_path;
+use crate::FtpError;
 use crate::plan::{DownloadPlan, ExistingFiles, PlannedFile};
-use crate::{FtpClient, FtpError};
+use crate::workers::{Job, run_round};
 
 /// Most connections opened at once.
 pub const MAX_WORKERS: usize = 8;
 
-/// Size of the write buffer of each connection.
-const WRITE_BUFFER: usize = 256 * 1024;
+/// How often files that failed are downloaded again.
+pub const MAX_RETRIES: u32 = 3;
 
 /// Totals of a copy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -36,17 +38,24 @@ pub struct CopyStats {
     pub skipped: u64,
     /// Files already on the PC with the same size, not downloaded again.
     pub existing: u64,
+    /// Files that failed at first and were downloaded again successfully.
+    pub retried: u64,
 }
 
-/// What happens during [`FtpClient::download_parallel`].
+/// What happens during [`DownloadPlan::download`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferEvent<'a> {
-    /// The directories were walked; these files will be downloaded.
+    /// These files will be downloaded.
     Planned(&'a [PlannedFile]),
     /// Connection `worker` started downloading `file`.
     Started {
         /// Connection index.
         worker: usize,
+        /// The file.
+        file: &'a PlannedFile,
+    },
+    /// `file` is already on the PC with the right size and was skipped.
+    Skipped {
         /// The file.
         file: &'a PlannedFile,
     },
@@ -57,7 +66,8 @@ pub enum TransferEvent<'a> {
         /// Bytes of the current file received so far.
         received: u64,
     },
-    /// Connection `worker` completed `file` (`received` bytes).
+    /// Connection `worker` completed `file` (`received` bytes) and its size
+    /// matches the server.
     Finished {
         /// Connection index.
         worker: usize,
@@ -66,21 +76,33 @@ pub enum TransferEvent<'a> {
         /// Bytes received.
         received: u64,
     },
+    /// Connection `worker` failed to download `file`; it will be retried.
+    Failed {
+        /// Connection index.
+        worker: usize,
+        /// The file.
+        file: &'a PlannedFile,
+    },
+    /// Retry round `round` (1-based) starts with `files` files.
+    Retrying {
+        /// Retry round, from 1 to [`MAX_RETRIES`].
+        round: u32,
+        /// Files downloaded again.
+        files: usize,
+    },
 }
 
 impl DownloadPlan {
-    /// Downloads the files over `workers` connections to `host`.
+    /// Downloads the files over `workers` connections to `host`, checking
+    /// each file and downloading failed ones again (see the module docs).
     ///
-    /// `existing` decides about files already on the PC; a file whose
-    /// download fails is removed. `events` follows the transfer and may
-    /// cancel it.
+    /// `existing` decides, file by file, about files already on the PC.
     ///
     /// # Errors
     ///
-    /// Returns the first error of any connection: [`FtpError::Io`] when a
-    /// local file already exists (with [`ExistingFiles::Fail`]) or cannot be
-    /// written, [`FtpError::Cancelled`] when `events` cancelled, and any
-    /// error of downloading.
+    /// Returns [`FtpError::Cancelled`] when `events` cancelled and
+    /// [`FtpError::Incomplete`] with the files that still failed after
+    /// [`MAX_RETRIES`] retries.
     pub fn download<F>(
         &self,
         host: &str,
@@ -95,193 +117,57 @@ impl DownloadPlan {
             skipped: self.links,
             ..CopyStats::default()
         };
-        let mut planned = Vec::new();
-        let mut locals = Vec::new();
-        for ((file, local), present) in self.files.iter().zip(&self.locals).zip(&self.existing) {
-            match (present, existing) {
-                (Some(_), ExistingFiles::Fail) => {
-                    return Err(with_path(std::io::ErrorKind::AlreadyExists.into(), local).into());
-                }
-                (Some(size), ExistingFiles::SkipComplete) if *size == file.size => {
-                    stats.existing += 1;
-                }
-                _ => {
-                    planned.push(file.clone());
-                    locals.push(local.clone());
-                }
-            }
-        }
-        if events(TransferEvent::Planned(&planned)).is_break() {
+        let planned = &self.files;
+        let mut pending: Vec<Job> = self
+            .locals
+            .iter()
+            .enumerate()
+            .map(|(index, local)| Job {
+                index,
+                local: local.clone(),
+            })
+            .collect();
+        if events(TransferEvent::Planned(planned)).is_break() {
             return Err(FtpError::Cancelled);
         }
 
-        // Largest first: long transfers start early and the end stays even.
-        let mut jobs: Vec<Job> = locals
-            .into_iter()
-            .enumerate()
-            .map(|(index, local)| Job { index, local })
-            .collect();
-        jobs.sort_by_key(|job| std::cmp::Reverse(planned[job.index].size));
-        let workers = workers.clamp(1, MAX_WORKERS).min(jobs.len().max(1));
-        let shared = Shared {
-            files: &planned,
-            queue: Mutex::new(jobs.into()),
-            overwrite: existing != ExistingFiles::Fail,
-            stop: AtomicBool::new(false),
-            error: Mutex::new(None),
-            events: &events,
-        };
-        let results: Vec<(u64, u64)> = thread::scope(|scope| {
-            let handles: Vec<_> = (0..workers)
-                .map(|worker_index| {
-                    let shared = &shared;
-                    scope.spawn(move || worker(host, worker_index, shared))
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap_or((0, 0)))
-                .collect()
-        });
-
-        if let Some(err) = shared.error.into_inner().ok().flatten() {
-            return Err(err);
-        }
-        for (files, bytes) in results {
-            stats.files += files;
-            stats.bytes += bytes;
-        }
-        Ok(stats)
-    }
-}
-
-/// A file to download.
-struct Job {
-    /// Index into the planned files.
-    index: usize,
-    /// Path on the PC.
-    local: PathBuf,
-}
-
-/// State shared by the workers.
-struct Shared<'a, F> {
-    /// The planned files.
-    files: &'a [PlannedFile],
-    /// Files still to download.
-    queue: Mutex<VecDeque<Job>>,
-    /// Whether existing local files are replaced.
-    overwrite: bool,
-    /// Set when a worker failed or the user cancelled.
-    stop: AtomicBool,
-    /// First error.
-    error: Mutex<Option<FtpError>>,
-    /// Event callback.
-    events: &'a F,
-}
-
-impl<F: Fn(TransferEvent<'_>) -> ControlFlow<()> + Sync> Shared<'_, F> {
-    /// Records the first error and stops the other workers.
-    fn fail(&self, err: FtpError) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Ok(mut slot) = self.error.lock() {
-            if slot.is_none() || matches!(slot.as_ref(), Some(FtpError::Cancelled)) {
-                *slot = Some(err);
-            }
-        }
-    }
-
-    /// Reports `event` and asks whether to go on.
-    fn report(&self, event: TransferEvent<'_>) -> ControlFlow<()> {
-        if self.stop.load(Ordering::Relaxed) {
-            return ControlFlow::Break(());
-        }
-        (self.events)(event)
-    }
-
-    /// Takes the next file, unless stopped.
-    fn next(&self) -> Option<Job> {
-        if self.stop.load(Ordering::Relaxed) {
-            return None;
-        }
-        self.queue.lock().ok()?.pop_front()
-    }
-}
-
-/// Downloads files from the queue on a connection of its own; returns the
-/// files and bytes it completed.
-fn worker<F: Fn(TransferEvent<'_>) -> ControlFlow<()> + Sync>(
-    host: &str,
-    index: usize,
-    shared: &Shared<'_, F>,
-) -> (u64, u64) {
-    let mut client = match FtpClient::connect(host) {
-        Ok(client) => client,
-        Err(err) => {
-            shared.fail(err);
-            return (0, 0);
-        }
-    };
-    let (mut files, mut bytes) = (0, 0);
-    while let Some(job) = shared.next() {
-        match download_one(&mut client, index, &job, shared) {
-            Ok(n) => {
-                files += 1;
-                bytes += n;
-            }
-            Err(err) => {
-                shared.fail(err);
+        let mut policy = existing;
+        for round in 0..=MAX_RETRIES {
+            if pending.is_empty() {
                 break;
             }
+            if round > 0 {
+                let event = TransferEvent::Retrying {
+                    round,
+                    files: pending.len(),
+                };
+                if events(event).is_break() {
+                    return Err(FtpError::Cancelled);
+                }
+                // A failed file may have been left behind: replace it.
+                policy = ExistingFiles::Overwrite;
+            }
+            let result = run_round(host, planned, pending, policy, workers, &events);
+            if result.cancelled {
+                return Err(FtpError::Cancelled);
+            }
+            stats.files += result.files;
+            stats.bytes += result.bytes;
+            stats.existing += result.existing;
+            if round > 0 {
+                stats.retried += result.files;
+            }
+            pending = result.failed;
         }
-    }
-    if !shared.stop.load(Ordering::Relaxed) {
-        client.quit();
-    }
-    (files, bytes)
-}
 
-/// Downloads one file; removes it again when the download fails.
-fn download_one<F: Fn(TransferEvent<'_>) -> ControlFlow<()> + Sync>(
-    client: &mut FtpClient,
-    worker: usize,
-    job: &Job,
-    shared: &Shared<'_, F>,
-) -> Result<u64, FtpError> {
-    let file = &shared.files[job.index];
-    if shared
-        .report(TransferEvent::Started { worker, file })
-        .is_break()
-    {
-        return Err(FtpError::Cancelled);
-    }
-    let local = if shared.overwrite {
-        File::create(&job.local)
-    } else {
-        File::create_new(&job.local)
-    }
-    .map_err(|e| with_path(e, &job.local))?;
-    let mut out = BufWriter::with_capacity(WRITE_BUFFER, local);
-    let result = client.retrieve(&file.remote, &mut out, |received| {
-        shared.report(TransferEvent::Progress { worker, received })
-    });
-    let result = result.and_then(|received| {
-        out.into_inner()
-            .map_err(std::io::IntoInnerError::into_error)?;
-        Ok(received)
-    });
-    match result {
-        Ok(received) => {
-            // The file is complete: a cancel request applies to the next one.
-            let _ = shared.report(TransferEvent::Finished {
-                worker,
-                file,
-                received,
-            });
-            Ok(received)
-        }
-        Err(err) => {
-            let _ = fs::remove_file(&job.local);
-            Err(err)
+        if pending.is_empty() {
+            Ok(stats)
+        } else {
+            let files = pending
+                .iter()
+                .map(|job| planned[job.index].remote.clone())
+                .collect();
+            Err(FtpError::Incomplete(files))
         }
     }
 }

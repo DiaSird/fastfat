@@ -16,6 +16,8 @@ pub enum FtpError {
     Protocol(&'static str),
     /// The operation was cancelled by the progress callback.
     Cancelled,
+    /// These files (server paths) still failed after every retry.
+    Incomplete(Vec<String>),
 }
 
 impl fmt::Display for FtpError {
@@ -25,6 +27,14 @@ impl fmt::Display for FtpError {
             Self::Reply(code, text) => write!(f, "FTP server replied {code}: {text}"),
             Self::Protocol(what) => write!(f, "FTP error: {what}"),
             Self::Cancelled => f.write_str("the operation was cancelled"),
+            Self::Incomplete(files) => {
+                write!(
+                    f,
+                    "{} file(s) could not be downloaded: {}",
+                    files.len(),
+                    files.join(", ")
+                )
+            }
         }
     }
 }

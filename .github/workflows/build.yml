@@ -1,0 +1,83 @@
+# Builds and tests on Windows (MSVC), Linux and macOS, and uploads the
+# Windows executable as an artifact (Actions run page -> "Artifacts" ->
+# fastfat-windows-x64).
+#
+# The GUI is Windows only: on Linux and macOS the binary only prints a
+# message, so those jobs build and test the platform independent crates
+# (FTP, FAT32, MBR, cloning) without uploading anything.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Overrides rust-toolchain.toml (which pins the Windows GNU toolchain for
+  # local builds): each runner uses stable for its own platform.
+  RUSTUP_TOOLCHAIN: stable
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-msvc
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: fastfat-windows-x64
+          - name: linux
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: macos
+            os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt --target ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Check formatting
+        if: matrix.name == 'linux'
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked --target ${{ matrix.target }} -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked --target ${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Collect files
+        if: matrix.artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/fastfat.exe, README.md, LICENSE dist/
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.artifact
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/
+          if-no-files-found: error

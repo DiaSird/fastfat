@@ -220,6 +220,27 @@ impl eframe::App for FastFatApp {
         self.poll_transfers(ui.ctx());
         self.guard_close(ui.ctx());
 
+        // Progress and messages live in a bottom panel whose top edge can be
+        // dragged, so they never fall off the window.
+        let show_bottom =
+            self.transfers.is_busy() || self.job.is_some() || !matches!(self.status, Status::None);
+        if show_bottom {
+            egui::Panel::bottom("bottom")
+                .resizable(true)
+                .default_size(BOTTOM_HEIGHT)
+                .size_range(BOTTOM_MIN_HEIGHT..=BOTTOM_MAX_HEIGHT)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.transfers.draw(ui);
+                            self.progress_section(ui);
+                            ui.add_space(4.0);
+                            self.status_section(ui);
+                        });
+                });
+        }
+
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(t("app.title"));
@@ -248,16 +269,20 @@ impl eframe::App for FastFatApp {
                     Tab::Ftp => self.ftp_section(ui),
                 }
             });
-            ui.add_space(8.0);
-            self.transfers.draw(ui);
-            self.progress_section(ui);
-            ui.add_space(8.0);
-            self.status_section(ui);
         });
 
         self.confirm_dialog(ui.ctx());
     }
 }
+
+/// Initial height of the bottom panel (progress and messages).
+const BOTTOM_HEIGHT: f32 = 170.0;
+
+/// Smallest height the bottom panel can be dragged to.
+const BOTTOM_MIN_HEIGHT: f32 = 40.0;
+
+/// Largest height the bottom panel can be dragged to.
+const BOTTOM_MAX_HEIGHT: f32 = 800.0;
 
 /// Finds the drive with the letter `selected` in `drives`.
 fn find_drive(drives: &[DriveInfo], selected: Option<char>) -> Option<&DriveInfo> {

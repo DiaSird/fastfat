@@ -1,10 +1,10 @@
 //! Step 1 of a download: walking the folders on the server.
 //!
 //! [`FtpClient::plan_download`] lists every file to download (folders with
-//! everything below them), creates the matching folders on the PC and notes
-//! which files already exist there. The result, a [`DownloadPlan`], lets the
-//! caller ask the user what to do with those files before anything is
-//! downloaded (step 2, see [`crate::download`]).
+//! everything below them) and creates the matching folders on the PC. The
+//! result is a [`DownloadPlan`]; step 2 is [`crate::download`]. Files that
+//! already exist on the PC are handled per file during step 2, following the
+//! [`ExistingFiles`] choice made before the transfer.
 
 use std::fs;
 use std::ops::ControlFlow;
@@ -26,13 +26,14 @@ pub struct PlannedFile {
     pub size: u64,
 }
 
-/// What to do with files that already exist on the PC.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What to do with a file that already exists on the PC, checked when the
+/// file's turn comes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ExistingFiles {
-    /// Fail before downloading anything.
-    Fail,
-    /// Skip files of the same size (taken as downloaded already) and
-    /// download the others again (taken as incomplete).
+    /// Skip it when it has the size of the file on the server (taken as
+    /// downloaded already); download it again otherwise (taken as
+    /// incomplete).
+    #[default]
     SkipComplete,
     /// Download and overwrite every file.
     Overwrite,
@@ -45,8 +46,6 @@ pub struct DownloadPlan {
     pub(crate) files: Vec<PlannedFile>,
     /// Their paths on the PC.
     pub(crate) locals: Vec<PathBuf>,
-    /// Size of the local file, for files that already exist.
-    pub(crate) existing: Vec<Option<u64>>,
     /// Links that are skipped.
     pub(crate) links: u64,
 }
@@ -57,27 +56,13 @@ impl DownloadPlan {
     pub fn files(&self) -> &[PlannedFile] {
         &self.files
     }
-
-    /// Returns how many files already exist on the PC, and how many of them
-    /// have the size of the file on the server.
-    #[must_use]
-    pub fn existing(&self) -> (u64, u64) {
-        let mut all = 0;
-        let mut complete = 0;
-        for (file, local) in self.files.iter().zip(&self.existing) {
-            if let Some(size) = local {
-                all += 1;
-                complete += u64::from(*size == file.size);
-            }
-        }
-        (all, complete)
-    }
 }
 
 impl FtpClient {
     /// Downloads `entries` of the directory `parent` into the existing local
-    /// directory `destination` over `workers` connections to `host`, never
-    /// overwriting (see [`Self::plan_download`] and [`DownloadPlan::download`]).
+    /// directory `destination` over `workers` connections to `host`, skipping
+    /// files already downloaded (see [`Self::plan_download`] and
+    /// [`DownloadPlan::download`]).
     ///
     /// # Errors
     ///
@@ -96,7 +81,7 @@ impl FtpClient {
         F: Fn(TransferEvent<'_>) -> ControlFlow<()> + Sync,
     {
         let plan = self.plan_download(parent, entries, destination)?;
-        plan.download(host, ExistingFiles::Fail, workers, events)
+        plan.download(host, ExistingFiles::SkipComplete, workers, events)
     }
 
     /// Lists every file of `entries` (in the directory `parent`), directories
@@ -117,16 +102,6 @@ impl FtpClient {
         for entry in entries {
             self.plan(&join(parent, &entry.name), entry, destination, 0, &mut plan)?;
         }
-        plan.existing = plan
-            .locals
-            .iter()
-            .map(|local| {
-                fs::metadata(local)
-                    .ok()
-                    .filter(std::fs::Metadata::is_file)
-                    .map(|m| m.len())
-            })
-            .collect();
         Ok(plan)
     }
 

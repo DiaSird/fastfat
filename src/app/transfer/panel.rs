@@ -1,12 +1,11 @@
-//! The progress panel above the progress bar: the question about existing
-//! files, the files being received, their folder, the totals, speed and
+//! The progress panel above the progress bar: the files being received, their folder, the totals, speed and
 //! time left, and the cancel button.
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use eframe::egui;
-use fastfat_ftp::{self as ftp, ExistingFiles};
+use fastfat_ftp as ftp;
 use fastfat_units::format_size;
 
 use super::Transfers;
@@ -23,40 +22,13 @@ impl Transfers {
         let Ok(mut view) = running.view.lock() else {
             return;
         };
-        if view.planned && view.question.is_none() {
+        if view.planned {
             let done = view.total.bytes_done + view.in_flight(None);
             view.speed.sample(done);
         }
         let cancelling = running.cancel.load(Ordering::Relaxed);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            if let Some((existing, complete)) = view.question {
-                ui.colored_label(
-                    ui.visuals().warn_fg_color,
-                    tf(
-                        "transfer.existing",
-                        &[("existing", &existing), ("complete", &complete)],
-                    ),
-                );
-                ui.horizontal(|ui| {
-                    let only_new = ui.button(t("transfer.only_new")).clicked();
-                    let overwrite = ui.button(t("transfer.overwrite")).clicked();
-                    let cancel = ui.button(t("job.cancel")).clicked();
-                    let answer = if only_new {
-                        Some(Some(ExistingFiles::SkipComplete))
-                    } else if overwrite {
-                        Some(Some(ExistingFiles::Overwrite))
-                    } else if cancel {
-                        Some(None)
-                    } else {
-                        None
-                    };
-                    if let Some(answer) = answer {
-                        let _ = running.answer.send(answer);
-                    }
-                });
-                return;
-            }
             if view.planned {
                 for active in view.active.iter().flatten() {
                     draw_file(ui, &view, active);
@@ -100,6 +72,27 @@ impl Transfers {
                         ("eta", &eta),
                     ],
                 ));
+            }
+            if let Some((round, files)) = view.retry {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    tf(
+                        "transfer.retrying",
+                        &[
+                            ("round", &round),
+                            ("max", &ftp::MAX_RETRIES),
+                            ("files", &files),
+                        ],
+                    ),
+                );
+            } else if view.failures > 0 {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    tf("transfer.failures", &[("count", &view.failures)]),
+                );
+            }
+            if view.skipped > 0 {
+                ui.weak(tf("transfer.skipped", &[("count", &view.skipped)]));
             }
             if !self.queue.is_empty() {
                 ui.weak(tf("transfer.queued", &[("count", &self.queue.len())]));

@@ -7,7 +7,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
-use fastfat_ftp::{self as ftp, FtpClient, FtpEntry, FtpEntryKind, FtpError};
+use fastfat_ftp::{self as ftp, ExistingFiles, FtpClient, FtpEntry, FtpEntryKind, FtpError};
 use fastfat_units::format_size;
 
 use super::browser::{self, Action, Row, RowKind};
@@ -30,6 +30,9 @@ const SHORTCUTS: [(&str, &str); 5] = [
     ),
 ];
 
+/// Narrowest width a pane can be dragged to.
+const MIN_PANE_WIDTH: f32 = 200.0;
+
 /// Result of a background listing.
 type Listing = Result<Vec<FtpEntry>, String>;
 
@@ -50,6 +53,8 @@ pub(super) struct FtpState {
     selected: Vec<bool>,
     /// Connections used for downloads.
     workers: usize,
+    /// What to do with files already on the PC.
+    existing: ExistingFiles,
     /// Listing in progress: its path and the channel of its result.
     listing: Option<(String, Receiver<Listing>)>,
 }
@@ -63,6 +68,7 @@ impl Default for FtpState {
             entries: Vec::new(),
             selected: Vec::new(),
             workers: DEFAULT_WORKERS,
+            existing: ExistingFiles::default(),
             listing: None,
         }
     }
@@ -117,6 +123,20 @@ impl FastFatApp {
             ui.label(t("ftp.workers"));
             ui.add(egui::DragValue::new(&mut self.ftp.workers).range(1..=ftp::MAX_WORKERS))
                 .on_hover_text(t("ftp.workers_hint"));
+            ui.separator();
+            ui.label(t("ftp.existing"));
+            ui.radio_value(
+                &mut self.ftp.existing,
+                ExistingFiles::SkipComplete,
+                t("transfer.only_new"),
+            )
+            .on_hover_text(t("ftp.only_new_hint"));
+            ui.radio_value(
+                &mut self.ftp.existing,
+                ExistingFiles::Overwrite,
+                t("transfer.overwrite"),
+            )
+            .on_hover_text(t("ftp.overwrite_hint"));
         });
         ui.collapsing(t("ftp.setup_title"), |ui| {
             ui.label(t("ftp.setup1"));
@@ -236,6 +256,7 @@ impl FastFatApp {
             entries,
             destination,
             workers: self.ftp.workers,
+            existing: self.ftp.existing,
         });
     }
 
@@ -259,10 +280,17 @@ impl FastFatApp {
         let can_up = path != "/";
         let mut action = None;
         let mut dropped = None;
-        ui.columns(2, |columns| {
-            dropped = self.local.draw(&mut columns[0]);
+        // The PC pane is a left panel whose right edge can be dragged; the
+        // Wii U pane takes the rest.
+        let width = ui.available_width();
+        egui::Panel::left("ftp_pc_pane")
+            .resizable(true)
+            .default_size(width / 2.0)
+            .size_range(MIN_PANE_WIDTH..=(width - MIN_PANE_WIDTH).max(MIN_PANE_WIDTH))
+            .show(ui, |ui| dropped = self.local.draw(ui));
+        egui::CentralPanel::default().show(ui, |ui| {
             action = browser::draw_remote(
-                &mut columns[1],
+                ui,
                 "ftp",
                 &path,
                 can_up,
@@ -321,6 +349,9 @@ impl FastFatApp {
                         ),
                     ],
                 );
+                if stats.retried > 0 {
+                    text.push_str(&tf("transfer.retried", &[("count", &stats.retried)]));
+                }
                 if stats.existing > 0 {
                     text.push_str(&tf(
                         "transfer.skipped_existing",
@@ -330,6 +361,17 @@ impl FastFatApp {
                 Status::Success(text)
             }
             Err(FtpError::Cancelled) => Status::Info(Cow::Borrowed(t("job.cancelled_copy"))),
+            Err(FtpError::Incomplete(files)) => Status::Error(tf(
+                "transfer.incomplete",
+                &[
+                    ("count", &files.len()),
+                    ("max", &fastfat_ftp::MAX_RETRIES),
+                    (
+                        "files",
+                        &files.iter().take(5).cloned().collect::<Vec<_>>().join("\n"),
+                    ),
+                ],
+            )),
             Err(err) => Status::Error(err.to_string()),
         };
         self.local.reload();

@@ -1,5 +1,6 @@
 //! A minimal FTP server in a thread, imitating `ftpiiu` (MLSD replies that
-//! name the listed folder with its full path, passive mode only).
+//! name the listed folder with its full path, passive mode only). Two files
+//! under `/retry` arrive cut short, to test the retries.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -20,6 +21,10 @@ pub(super) fn files() -> Vec<(&'static str, Vec<u8>)> {
             (0..300_000_u32).map(|i| (i % 251) as u8).collect(),
         ),
         ("/with space/name with space.dat", vec![7; 10]),
+        // Sent cut in half the first time (see `session`).
+        ("/retry/once.bin", vec![1; 1000]),
+        // Always sent cut in half.
+        ("/retry/never.bin", vec![2; 1000]),
     ]
 }
 
@@ -142,9 +147,20 @@ fn session(stream: TcpStream, mlsd: bool, log: &Mutex<Vec<String>>) -> std::io::
                     writer.write_all(b"550 no such file\r\n")?;
                     continue;
                 };
+                // Imitate a broken transfer that still ends with "226".
+                let attempts = log
+                    .lock()
+                    .map_or(0, |l| l.iter().filter(|l| **l == line).count());
+                let cut = argument == "/retry/never.bin"
+                    || (argument == "/retry/once.bin" && attempts == 1);
+                let sent = if cut {
+                    &contents[..contents.len() / 2]
+                } else {
+                    &contents[..]
+                };
                 let (mut data, _) = listener.accept()?;
                 writer.write_all(b"150 sending\r\n")?;
-                let _ = data.write_all(&contents);
+                let _ = data.write_all(sent);
                 drop(data);
                 writer.write_all(b"226 done\r\n")?;
             }

@@ -5,6 +5,7 @@ mod fake_server;
 use std::fs;
 use std::ops::ControlFlow;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fake_server::{files, serve};
 
@@ -19,8 +20,8 @@ fn lists_and_downloads() {
 
         let root = client.list("/").unwrap_or_else(|e| panic!("{e}"));
         let names: Vec<&str> = root.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, ["storage_mlc", "with space", "a.txt"]);
-        assert_eq!(root[2].size, 5);
+        assert_eq!(names, ["retry", "storage_mlc", "with space", "a.txt"]);
+        assert_eq!(root[3].size, 5);
 
         let mut out = Vec::new();
         client
@@ -44,7 +45,7 @@ fn lists_and_downloads() {
         let planned: u64 = plan.files().iter().map(|f| f.size).sum();
         assert_eq!((plan.files().len(), planned), (2, 300_006));
         let stats = plan
-            .download(&address, ExistingFiles::Fail, 1, |_| {
+            .download(&address, ExistingFiles::SkipComplete, 1, |_| {
                 ControlFlow::Continue(())
             })
             .unwrap_or_else(|e| panic!("{e}"));
@@ -88,7 +89,10 @@ fn downloads_in_parallel() {
                     TransferEvent::Planned(files) => seen.0 = files.to_vec(),
                     TransferEvent::Started { .. } => seen.1 += 1,
                     TransferEvent::Finished { received, .. } => seen.2 += received,
-                    TransferEvent::Progress { .. } => {}
+                    TransferEvent::Progress { .. }
+                    | TransferEvent::Failed { .. }
+                    | TransferEvent::Retrying { .. }
+                    | TransferEvent::Skipped { .. } => {}
                 }
             }
             ControlFlow::Continue(())
@@ -107,11 +111,13 @@ fn downloads_in_parallel() {
     let big = fs::read(dir.join("101c9400").join("content").join("big.bin")).unwrap_or_default();
     assert_eq!(big, files()[2].1);
 
-    // A second run refuses to overwrite and leaves the files intact.
-    let again = client.download_parallel(&address, parent, &updates, &dir, 4, |_| {
-        ControlFlow::Continue(())
-    });
-    assert!(matches!(again, Err(FtpError::Io(_))));
+    // A second run skips the files already downloaded and leaves them intact.
+    let again = client
+        .download_parallel(&address, parent, &updates, &dir, 4, |_| {
+            ControlFlow::Continue(())
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!((again.files, again.existing), (0, 2));
     assert_eq!(
         fs::read(dir.join("101c9400").join("meta").join("meta.xml")).unwrap_or_default(),
         b"<xml/>"
@@ -153,27 +159,27 @@ fn detects_files_already_downloaded() {
     let plan = client
         .plan_download(parent, &updates, &dir)
         .unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(plan.existing(), (0, 0));
-    plan.download(&address, ExistingFiles::Fail, 1, go_on)
-        .unwrap_or_else(|e| panic!("{e}"));
-
-    // Everything is there with the right size: nothing is downloaded again.
-    let plan = client
-        .plan_download(parent, &updates, &dir)
-        .unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(plan.existing(), (2, 2));
     let stats = plan
         .download(&address, ExistingFiles::SkipComplete, 1, go_on)
         .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!((stats.files, stats.existing), (2, 0));
+
+    // Everything is there with the right size: checked per file, skipped.
+    let skipped = AtomicUsize::new(0);
+    let stats = plan
+        .download(&address, ExistingFiles::SkipComplete, 1, |event| {
+            if matches!(event, TransferEvent::Skipped { .. }) {
+                skipped.fetch_add(1, Ordering::Relaxed);
+            }
+            ControlFlow::Continue(())
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!((stats.files, stats.existing), (0, 2));
+    assert_eq!(skipped.into_inner(), 2);
 
     // A truncated file counts as incomplete and is downloaded again.
     let big = dir.join("101c9400").join("content").join("big.bin");
     fs::write(&big, b"partial").unwrap_or_else(|e| panic!("{e}"));
-    let plan = client
-        .plan_download(parent, &updates, &dir)
-        .unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(plan.existing(), (2, 1));
     let stats = plan
         .download(&address, ExistingFiles::SkipComplete, 1, go_on)
         .unwrap_or_else(|e| panic!("{e}"));
@@ -185,10 +191,50 @@ fn detects_files_already_downloaded() {
         .download(&address, ExistingFiles::Overwrite, 2, go_on)
         .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!((stats.files, stats.existing), (2, 0));
-    assert!(matches!(
-        plan.download(&address, ExistingFiles::Fail, 1, go_on),
-        Err(FtpError::Io(_))
-    ));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn downloads_failed_files_again() {
+    let (address, _) = serve(true);
+    let mut client = FtpClient::connect(&address).unwrap_or_else(|e| panic!("{e}"));
+    let entries = client.list("/retry").unwrap_or_else(|e| panic!("{e}"));
+    let pick = |name: &str| -> Vec<FtpEntry> {
+        entries.iter().filter(|e| e.name == name).cloned().collect()
+    };
+    let dir = std::env::temp_dir().join(format!("fastfat-ftp-retry-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+
+    // Cut short once: detected by its size, downloaded again, complete.
+    let failed = AtomicUsize::new(0);
+    let plan = client
+        .plan_download("/retry", &pick("once.bin"), &dir)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let stats = plan
+        .download(&address, ExistingFiles::SkipComplete, 1, |event| {
+            if matches!(event, TransferEvent::Failed { .. }) {
+                failed.fetch_add(1, Ordering::Relaxed);
+            }
+            ControlFlow::Continue(())
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!((stats.files, stats.retried), (1, 1));
+    assert_eq!(failed.into_inner(), 1);
+    assert_eq!(
+        fs::read(dir.join("once.bin")).unwrap_or_default(),
+        vec![1; 1000]
+    );
+
+    // Always cut short: reported after every retry, no bad copy left.
+    let plan = client
+        .plan_download("/retry", &pick("never.bin"), &dir)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let result = plan.download(&address, ExistingFiles::SkipComplete, 2, |_| {
+        ControlFlow::Continue(())
+    });
+    assert!(matches!(&result, Err(FtpError::Incomplete(files)) if files == &["/retry/never.bin"]));
+    assert!(!dir.join("never.bin").exists());
     let _ = fs::remove_dir_all(&dir);
 }
 
