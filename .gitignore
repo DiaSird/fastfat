@@ -1,0 +1,22 @@
+/target
+
+# Console-unique keys and dumps: never commit them.
+otp.bin
+seeprom.bin
+/backups/
+
+# Game images, titles and homebrew binaries.
+*.wud
+*.wux
+*.wua
+*.iso
+*.wbfs
+*.rpx
+*.rpl
+*.wuhb
+*.elf
+*.app
+*.h3
+*.tmd
+*.tik
+*.cert

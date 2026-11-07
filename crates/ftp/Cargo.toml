@@ -1,0 +1,12 @@
+[package]
+name = "fastfat-ftp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Read-only FTP client for downloading from a Wii U (ftpiiu)"
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

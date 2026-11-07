@@ -1,0 +1,16 @@
+[package]
+name = "fastfat-mbr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MBR partition tables and whole-disk FAT32 initialisation"
+publish = false
+
+[dependencies]
+fastfat-fat32 = { path = "../fat32" }
+
+[dev-dependencies]
+fatfs = "0.3.6"
+
+[lints]
+workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "fastfat-units"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Human readable byte counts"
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

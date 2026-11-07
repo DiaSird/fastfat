@@ -1,0 +1,6 @@
+[toolchain]
+# Default toolchain for plain `cargo` commands (and for building xtask).
+# The GNU toolchain links without Visual Studio; use
+# `cargo xtask msvc <command>` / `cargo xtask gnu <command>` to pick one
+# explicitly.
+channel = "stable-x86_64-pc-windows-gnu"

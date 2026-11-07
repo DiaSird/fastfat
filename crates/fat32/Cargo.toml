@@ -1,0 +1,15 @@
+[package]
+name = "fastfat-fat32"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Platform independent FAT32 file system writer"
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+fatfs = "0.3.6"
+
+[lints]
+workspace = true

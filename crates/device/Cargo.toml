@@ -1,0 +1,19 @@
+[package]
+name = "fastfat-device"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Windows drive enumeration and raw disk access"
+publish = false
+
+[dependencies]
+fastfat-fat32 = { path = "../fat32" }
+fastfat-mbr = { path = "../mbr" }
+fastfat-clone = { path = "../clone" }
+fastfat-units = { path = "../units" }
+
+[target.'cfg(windows)'.dependencies]
+windows_sys = { workspace = true }
+
+[lints]
+workspace = true
